@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from datetime import datetime
 
 from . import report
@@ -68,8 +69,35 @@ def main():
     parser.add_argument(
         "--examples", type=int, help="Number of examples to use (overrides default)"
     )
+    parser.add_argument(
+        "--n-repeats",
+        type=int,
+        default=None,
+        help="Number of times to repeat each example (default: 1 for debug, 8 otherwise)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=131_072,
+        help="Maximum number of tokens for model response",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Timeout in seconds for each API request (default: 600s = 10 min)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="run_artifacts/",
+        help="Directory to save output files (reports, metrics, results)",
+    )
 
     args = parser.parse_args()
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
 
     sampler_cls = ResponsesSampler if args.sampler == "responses" else ChatCompletionsSampler
 
@@ -82,7 +110,8 @@ def main():
                 reasoning_effort=reasoning_effort,
                 temperature=args.temperature,
                 base_url=args.base_url,
-                max_tokens=131_072,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
             )
 
     print(f"Running with args {args}")
@@ -95,56 +124,73 @@ def main():
     )
 
     def get_evals(eval_name, debug_mode):
+        """Returns (eval_obj, n_repeats, num_examples_or_none) for filename construction."""
         num_examples = (
             args.examples if args.examples is not None else (5 if debug_mode else None)
         )
+        # n_repeats priority: CLI arg > debug default (1) > normal default (8)
+        if args.n_repeats is not None:
+            n_repeats = args.n_repeats
+        else:
+            n_repeats = 1 if args.debug else 8
         # Set num_examples = None to reproduce full evals
         match eval_name:
             case "basic":
-                return BasicEval()
+                return BasicEval(), 1, None
             case "gpqa":
-                return GPQAEval(
-                    n_repeats=1 if args.debug else 8,
+                eval_obj = GPQAEval(
+                    n_repeats=n_repeats,
                     num_examples=num_examples,
                     debug=debug_mode,
                     n_threads=args.n_threads or 1,
                 )
+                return eval_obj, n_repeats, len(eval_obj.examples)
             case "healthbench":
-                return HealthBenchEval(
+                hb_num_examples = 10 if debug_mode else num_examples
+                eval_obj = HealthBenchEval(
                     grader_model=grading_sampler,
-                    num_examples=10 if debug_mode else num_examples,
+                    num_examples=hb_num_examples,
                     n_repeats=1,
                     n_threads=args.n_threads or 1,
                     subset_name=None,
                 )
+                return eval_obj, 1, len(eval_obj.examples)
             case "healthbench_hard":
-                return HealthBenchEval(
+                hb_num_examples = 10 if debug_mode else num_examples
+                eval_obj = HealthBenchEval(
                     grader_model=grading_sampler,
-                    num_examples=10 if debug_mode else num_examples,
+                    num_examples=hb_num_examples,
                     n_repeats=1,
                     n_threads=args.n_threads or 1,
                     subset_name="hard",
                 )
+                return eval_obj, 1, len(eval_obj.examples)
             case "healthbench_consensus":
-                return HealthBenchEval(
+                hb_num_examples = 10 if debug_mode else num_examples
+                eval_obj = HealthBenchEval(
                     grader_model=grading_sampler,
-                    num_examples=10 if debug_mode else num_examples,
+                    num_examples=hb_num_examples,
                     n_repeats=1,
                     n_threads=args.n_threads or 1,
                     subset_name="consensus",
                 )
+                return eval_obj, 1, len(eval_obj.examples)
             case "aime25":
-                return AIME25Eval(
-                    n_repeats=1 if args.debug else 8,
+                eval_obj = AIME25Eval(
+                    n_repeats=n_repeats,
                     num_examples=num_examples,
                     n_threads=args.n_threads or 1,
                 )
+                return eval_obj, n_repeats, len(eval_obj.examples)
             case _:
                 raise Exception(f"Unrecognized eval type: {eval_name}")
 
     evals = {}
+    eval_metadata = {}  # Store n_repeats and total_rows for filename
     for eval_name in args.eval.split(","):
-        evals[eval_name] = get_evals(eval_name, args.debug)
+        eval_obj, n_repeats, total_rows = get_evals(eval_name, args.debug)
+        evals[eval_name] = eval_obj
+        eval_metadata[eval_name] = {"n_repeats": n_repeats, "total_rows": total_rows}
 
     debug_suffix = "_DEBUG" if args.debug else ""
     print(debug_suffix)
@@ -159,10 +205,16 @@ def main():
         for eval_name, eval_obj in evals.items():
             result = eval_obj(sampler)
             # ^^^ how to use a sampler
-            file_stem = f"{eval_name}_{model_name}_temp{args.temperature}"
-            # file stem should also include the year, month, day, and time in hours and minutes
-            file_stem += f"_{date_str}"
-            report_filename = f"/tmp/{file_stem}{debug_suffix}.html"
+            
+            # Get metadata for filename
+            meta = eval_metadata[eval_name]
+            n_repeats = meta["n_repeats"]
+            total_rows = meta["total_rows"]
+            
+            # Build filename: eval_dataset_model_repeats_rows_temp_date
+            file_stem = f"{eval_name}_{model_name}_r{n_repeats}_n{total_rows}_temp{args.temperature}_{date_str}"
+            
+            report_filename = os.path.join(args.output_dir, f"{file_stem}{debug_suffix}.html")
             print(f"Writing report to {report_filename}")
             with open(report_filename, "w") as fh:
                 fh.write(report.make_report(result))
@@ -171,12 +223,12 @@ def main():
             # Sort metrics by key
             metrics = dict(sorted(metrics.items()))
             print(metrics)
-            result_filename = f"/tmp/{file_stem}{debug_suffix}.json"
+            result_filename = os.path.join(args.output_dir, f"{file_stem}{debug_suffix}.json")
             with open(result_filename, "w") as f:
                 f.write(json.dumps(metrics, indent=2))
             print(f"Writing results to {result_filename}")
 
-            full_result_filename = f"/tmp/{file_stem}{debug_suffix}_allresults.json"
+            full_result_filename = os.path.join(args.output_dir, f"{file_stem}{debug_suffix}_allresults.json")
             with open(full_result_filename, "w") as f:
                 result_dict = {
                     "score": result.score,
