@@ -26,8 +26,9 @@ class ChatCompletionsSampler(SamplerBase):
         reasoning_model: bool = False,
         reasoning_effort: str | None = None,
         base_url: str = "http://localhost:8000/v1",
+        timeout: float = 600.0,  # 10 minute timeout per request
     ):
-        self.client = OpenAI(base_url=base_url, timeout=24 * 60 * 60)
+        self.client = OpenAI(base_url=base_url, timeout=timeout)
         self.model = model
         self.system_message = system_message
         self.temperature = temperature

@@ -68,6 +68,18 @@ def main():
     parser.add_argument(
         "--examples", type=int, help="Number of examples to use (overrides default)"
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=131_072,
+        help="Maximum number of tokens for model response",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Timeout in seconds for each API request (default: 600s = 10 min)",
+    )
 
     args = parser.parse_args()
 
@@ -82,7 +94,8 @@ def main():
                 reasoning_effort=reasoning_effort,
                 temperature=args.temperature,
                 base_url=args.base_url,
-                max_tokens=131_072,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
             )
 
     print(f"Running with args {args}")
